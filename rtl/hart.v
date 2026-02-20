@@ -131,57 +131,272 @@ module hart #(
 `endif
 );
 
-// PC register (Edge Sensitive)
-reg [31:0] pc;
+    // =========================================================================
+    // 0) TOP-LEVEL INTERNAL WIRES / STATE
+    // =========================================================================
 
-always @(posedge i_clk) begin
-    if (i_rst)
-        pc <= RESET_ADDR;
-    else
-        // Jump/Branch Logic
-        // Input: pc, rs1, Offset, Jump + Branch * res[0]
-        // o_retire_pc <= pc;
-        // pc <= o_retire_next_pc;
-end
+    // PC register
+    reg  [31:0] pc;
 
-assign o_imem_raddr = pc;
+    // Instruction word (fetched)
+    wire [31:0] Inst;            // alias for i_imem_rdata in core
+    assign Inst = i_imem_rdata;
 
-// Fetch Module
-// Input: pc
-// Output: i_imem_rdata (Inst[31:0])
+    // Basic fields
+    wire [6:0] opcode;
+    wire [2:0] Func3;
+    wire [6:0] Func7;
+
+    // Control signals
+    wire        lui;     
+    wire        PcSrc;   
+    wire [3:0]  AluOp;   
+    wire        MemWrite;
+    wire        MemRead; 
+    wire        MemToReg;
+    wire        AluSrc1; 
+    wire        AluSrc2; 
+    wire        RegWrite;
+    wire        Jump;    
+    wire        Branch;  
+
+    // Immediate
+    wire [31:0] Offset;          // output of Immediate Generator
+
+    // Register file connections
+    // Read addresses: from decode
+    // Write address: from decode
+    // Read data: from regfile
+    wire [4:0]  rs1_raddr = o_retire_rs1_raddr;
+    wire [4:0]  rs2_raddr = o_retire_rs2_raddr;
+    wire [4:0]  rd_waddr  = o_retire_rd_waddr;
+
+    // Operand mux outputs
+    wire [31:0] Operand1;
+    wire [31:0] Operand2;
+
+    // ALU outputs from alu.v module
+    wire [31:0] AluResult;
+    wire        ALUeq;      
+    wire        ALUslt;             
+
+    // =========================================================================
+    // LSU pack/unpack intermediates
+    wire [31:0] EffAddr;          // effective address (usually AluResult)
+    assign EffAddr = AluResult;
+
+    wire [31:0] LoadData;         // unpacked + sign/zero-extended load value
+
+    // Writeback bus
+    wire [31:0] WriteData;         // final data to regfile (also o_retire_rd_wdata)
+
+    // Next PC logic
+    wire [31:0] pc_plus4 = pc + 32'd4;
+    wire [31:0] NextPC;
+    wire        BranchTaken;       // computed from branch/jump unit
+
+    // Trap/halt (retire)
+    wire        IllegalInst;       // decoder says illegal
+    wire        MisalignTrap;      // LSU / PC target misalign
+    wire        EBreak;            // decoder says ebreak
+
+    assign o_imem_raddr   = pc;
+    assign o_retire_pc    = pc;
+    assign o_retire_inst  = Inst;
+    assign o_retire_valid = ~i_rst;
+    assign o_retire_halt  = EBreak;
+
+    assign opcode = Inst[6:0];
+    assign Func3  = Inst[14:12];
+    assign Func7  = Inst[31:25];
+
+    // =========================================================================
+    // 1) PC REGISTER + INSTRUCTION FETCH "MODULE"
+    // =========================================================================
+    // Spec: Instruction memory is combinational read.
+    // - Provide address = pc (4-byte aligned expected)
+    // - Receive Inst = i_imem_rdata same cycle
+
+    // PC flop: single-cycle retires each cycle unless reset/stop.
+    // NOTE: if you want halt to freeze, gate update with ~EBreak.
+    always_ff @(posedge i_clk) begin
+        if (i_rst) pc <= RESET_ADDR;
+        else if (EBreak) pc <= pc;      // freeze
+        else pc <= NextPC;
+    end
+
+    // TODO: NextPC to be computed below
+    // Jump/Branch logic is seperated for future pipelining
 
 
-// Decode Module (Edge Sensitive)
-// Inputs: i_imem_rdata (Inst[31:0])
-// Outputs: 
-//      CONTROLs: lui, PcSrc, AluOp, o_dmem_wen (MemWrite), o_dmem_ren (MemRead), MemToReg, AluSrc1, AluSrc2, RegWrite, Jump, Branch
-//      DATA: 
-//          Before RF: o_retire_rs1_raddr (Read Reg1), o_retire_rs2_raddr (Read Reg2), o_retire_rd_waddr (Write Reg), o_retire_rd_wdata (Write Data)
-//          After RF:  o_retire_rs1_rdata (Read Data1), o_retire_rs2_rdata (Read Data2) == o_dmem_wdata (Read Data1 -> Write Data)
-// 
-// RegWrite
-// Inputs: i_dmem_rdata (Read Data from DATA MEMORY), lui, MemToReg, RegWrite
-// A MUX with lui selection to Write Data
+    // =========================================================================
+    // 2) DECODE MODULE (COMBINATIONAL) — control + reg addrs + imm
+    // =========================================================================
+    //
+    // Inputs:
+    //   - Inst (32-bit)
+    //
+    // Outputs:
+    //   - CONTROLs:
+    //       lui, PcSrc, AluOp,
+    //       MemWrite, MemRead, MemToReg,
+    //       AluSrc1, AluSrc2,
+    //       RegWrite, Jump, Branch
+    //
+    //   - Retire register fields (already “semantic”, already zeroed when unused):
+    //       o_retire_rs1_raddr, o_retire_rs2_raddr, o_retire_rd_waddr
+    //       o_retire_rs1_rdata, o_retire_rs2_rdata
+    //
+    //   - Exception flags:
+    //       IllegalInst, EBreak
+    //
+
+    decode #(.BYPASS_EN(0)) u_decode (
+      .i_clk            (i_clk),
+      .i_rst            (i_rst),
+      .Inst             (Inst),
+      // NOTICE!! The writedata in pipeline should be 3 stages later than the readdata! 
+      .WriteData        (WriteData),
+    
+      .lui              (lui),
+      .PcSrc            (PcSrc),
+      .AluOp            (AluOp),
+      .MemWrite         (MemWrite),
+      .MemRead          (MemRead),
+      .MemToReg         (MemToReg),
+      .AluSrc1          (AluSrc1),
+      .AluSrc2          (AluSrc2),
+      .RegWrite         (RegWrite),
+      .Jump             (Jump),
+      .Branch           (Branch),
+
+      .Offset           (Offset),
+    
+      .o_retire_rs1_raddr(o_retire_rs1_raddr),
+      .o_retire_rs2_raddr(o_retire_rs2_raddr),
+      .o_retire_rd_waddr (o_retire_rd_waddr),
+      .o_retire_rs1_rdata(o_retire_rs1_rdata),
+      .o_retire_rs2_rdata(o_retire_rs2_rdata),
+    
+      .IllegalInst      (IllegalInst),
+      .EBreak           (EBreak)
+    );
 
 
-// Execute Module
-// Inputs:
-//      CONTROLs: AluSrc1, AluSrc2, AluOp
-//      DATA: o_retire_pc (PC)
-// Outputs: o_dmem_addr (Result->Address)
+    // I seperate 2 AluSrc Mux from Exeecute Module
+    // because these two mux will be modified for pipelined
+    assign Operand1 = AluSrc1 ? o_retire_pc : o_retire_rs1_rdata;
+    assign Operand2 = AluSrc2 ? Offset      : o_retire_rs2_rdata;
+
+    // =========================================================================
+    // 3) EXECUTE MODULE — ALU CONTROL UNIT + ALU
+    // =========================================================================
+    //
+    // Goal:
+    //   - Turn decoded AluOp into the *actual* ALU control pins required by alu.v
+    //   - Compute AluResult + flags (ALUeq, ALUslt)
+    //
+    // Inputs:
+    //   CONTROLs:
+    //     AluOp      [3:0]
+    //
+    //   DATA:
+    //     Operand1   [31:0]
+    //     Operand2   [31:0]
+    //
+    //   INST bits needed for ALU-control refinement:
+    //     Func3      [2:0]
+    //     Func7      [6:0]
+    //     opcode     [6:0] (optional, depends on how you encoded AluOp)
+    //
+    // Outputs:
+    //   AluResult  [31:0]  (goes to EffAddr for loads/stores; also WB for ALU ops)
+    //   ALUeq              (branch compare eq)
+    //   ALUslt             (branch compare lt/slt result depending on unsigned control)
+
+    execute u_execute (
+        .AluOp     (AluOp),
+        .Func3     (Func3),
+        .Func7     (Func7),
+        .opcode    (opcode),
+        .Operand1  (Operand1),
+        .Operand2  (Operand2),
+        .AluResult (AluResult),
+        .ALUeq     (ALUeq),
+        .ALUslt    (ALUslt)
+    );
 
 
-// DATA MEMORY read/write
-// Inputs: o_dmem_addr, o_dmem_wdata, Func3, o_dmem_ren, o_dmem_wen
-// Output: o_dmem_wdata (Read Data)
+    // =========================================================================
+    // 4) MEMORY
+    // =========================================================================
+    // 
+    // NOTE:
+    //   - o_dmem_addr must be word-aligned
+    //   - mask (I don't get it, Like; figure that out and teach me)
+    //   - Exclusive ren and wen
+    //
+    // Inputs (from earlier stages):
+    //   EffAddr       [31:0]   (already assigned with AluResult)
+    //   StoreData     [31:0]   (o_retire_rs2_rdata)
+    //   Func3         [2:0]    (Func3)
+    //   MemRead, MemWrite
+    //
+    // Outputs (to top-level dmem port):
+    //   o_dmem_addr   [31:0]   aligned
+    //   o_dmem_mask   [3:0]
+    //   o_dmem_wdata  [31:0]   lane-shifted
+    //   o_dmem_ren, o_dmem_wen
+    //   MisalignTrap
+    //
+    // Output (to WB):
+    //   LoadData      [31:0]   final value for lb/lh/lw etc.
+
+    memory u_memory (
+        .EffAddr        (EffAddr),
+        .StoreData      (o_retire_rs2_rdata),
+        .Func3          (Func3),
+        .MemRead        (MemRead),
+        .MemWrite       (MemWrite),
+        .i_dmem_rdata   (i_dmem_rdata),
+
+        .o_dmem_addr    (o_dmem_addr),
+        .o_dmem_mask    (o_dmem_mask),
+        .o_dmem_wdata   (o_dmem_wdata),
+        .o_dmem_ren     (o_dmem_ren),
+        .o_dmem_wen     (o_dmem_wen),
+
+        .LoadData       (LoadData),
+        .MisalignTrap   (MisalignTrap)
+    );
 
 
-// others:
-// o_retire_inst === i_imem_rdata
-// output wire [ 3:0] o_dmem_mask,
-// output wire        o_retire_valid,
-// output wire        o_retire_trap,
-// output wire        o_retire_halt,
+    // =========================================================================
+    // 5) WRITEBACK
+    // =========================================================================
+    //
+    // Inputs:
+    //   AluResult  [31:0]
+    //   LoadData   [31:0]
+    //   pc_plus4   [31:0]
+    //   Offset     [31:0]   (for LUI, and for AUIPC if you implement that style)
+    //   CONTROLs: MemToReg, lui, Jump
+    //
+    // Output:
+    //   WriteData  [31:0]
+
+    writeback u_writeback (
+        .AluResult (AluResult),
+        .LoadData  (LoadData),
+        .pc_plus4  (pc_plus4),
+        .Offset    (Offset),
+        .MemToReg  (MemToReg),
+        .lui       (lui),
+        .Jump      (Jump),
+        .WriteData (WriteData)
+    );    
+
+    assign o_retire_rd_wdata = WriteData;
 
 endmodule
 
