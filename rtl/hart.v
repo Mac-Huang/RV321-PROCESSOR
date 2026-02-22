@@ -155,8 +155,12 @@ module hart #(
     wire        MemRead; 
     wire        MemToReg;
     wire        AluSrc1; 
-    wire        AluSrc2; 
-    wire        RegWrite;
+    wire        AluSrc2;
+    // Both RegWrite are the same before being pipelined
+    wire        EX_RegWrite;
+    wire        WB_RegWrite;
+    wire [3:0]  EX_WriteAddr;
+    wire [3:0]  WB_WriteAddr;
     wire        Jump;    
     wire        Branch;  
 
@@ -225,23 +229,41 @@ module hart #(
         else pc <= NextPC;
     end
 
-    // TODO: NextPC to be computed below
+    // NextPC to be computed below
     // Jump/Branch logic is seperated for future pipelining
+    wire BranchTaken;
+    assign BranchTaken = 
+        (Func3 == 3'b000) ?  ALUeq :
+        (Func3 == 3'b001) ? ~ALUeq :
+        (Func3 == 3'b100) ?  ALUslt :
+        (Func3 == 3'b101) ? ~ALUslt :
+        (Func3 == 3'b110) ?  ALUslt :
+        (Func3 == 3'b111) ? ~ALUslt :
+        1'b0;
 
+    wire do_branch = Branch & BranchTaken;
+    wire do_jump   = Jump;
+
+    wire [31:0] nextpc_base = PcSrc ? o_retire_rs1_rdata : pc;
+    wire [31:0] nextpc_add  = (do_jump | do_branch) ? Offset : 32'd4;
+    wire [31:0] nextpc_raw  = nextpc_base + nextpc_add;
+
+    // JALR requires bit0 = 0 (RISC-V spec)
+    assign NextPC = (do_jump & PcSrc) ? (nextpc_raw & 32'hFFFF_FFFE) : nextpc_raw;
 
     // =========================================================================
     // 2) DECODE MODULE (COMBINATIONAL) — control + reg addrs + imm
     // =========================================================================
     //
     // Inputs:
-    //   - Inst (32-bit)
+    //   - i_clk, i_rst, Inst (32-bit), WriteData, WB_RegWrite
     //
     // Outputs:
     //   - CONTROLs:
     //       lui, PcSrc, AluOp,
     //       MemWrite, MemRead, MemToReg,
     //       AluSrc1, AluSrc2,
-    //       RegWrite, Jump, Branch
+    //       EX_RegWrite, Jump, Branch
     //
     //   - Retire register fields (already “semantic”, already zeroed when unused):
     //       o_retire_rs1_raddr, o_retire_rs2_raddr, o_retire_rd_waddr
@@ -257,6 +279,8 @@ module hart #(
       .Inst             (Inst),
       // NOTICE!! The writedata in pipeline should be 3 stages later than the readdata! 
       .WriteData        (WriteData),
+      .WriteAddr        (WB_WriteAdd),
+      .WriteEn          (WB_RegWrite),
     
       .lui              (lui),
       .PcSrc            (PcSrc),
@@ -266,7 +290,7 @@ module hart #(
       .MemToReg         (MemToReg),
       .AluSrc1          (AluSrc1),
       .AluSrc2          (AluSrc2),
-      .RegWrite         (RegWrite),
+      .RegWrite         (EX_RegWrite),
       .Jump             (Jump),
       .Branch           (Branch),
 
@@ -274,7 +298,7 @@ module hart #(
     
       .o_retire_rs1_raddr(o_retire_rs1_raddr),
       .o_retire_rs2_raddr(o_retire_rs2_raddr),
-      .o_retire_rd_waddr (o_retire_rd_waddr),
+      .o_retire_rd_waddr (o_retire_rd_waddr), // EX_WriteAddr
       .o_retire_rs1_rdata(o_retire_rs1_rdata),
       .o_retire_rs2_rdata(o_retire_rs2_rdata),
     
@@ -282,6 +306,14 @@ module hart #(
       .EBreak           (EBreak)
     );
 
+    assign EX_WriteAddr = o_retire_rd_waddr; 
+    assign WB_WriteAddr = EX_WriteAddr; 
+    assign WB_RegWrite  = EX_RegWrite; // It's the same in one cycle design
+    // It might be confusing that EX_RegWrite is the output while
+    // WB_RegWrite is the input. Then how come assign the output to the input.
+    // The answer is that it's asynchronous when the Instruction decoder
+    // decoding the instruction to controls (RegRead), and the write reg is synchronous,
+    // which is not triggered before `assign WB_RegWrite = EX_RegWrite;`
 
     // I seperate 2 AluSrc Mux from Exeecute Module
     // because these two mux will be modified for pipelined
